@@ -36,6 +36,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Telethon ke internal spam logs band karo
+logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("telethon.network").setLevel(logging.WARNING)
+logging.getLogger("telethon.client").setLevel(logging.WARNING)
+
 # ── Hardcoded Config ──────────────────────────────────────────────────────────
 INVITE_HASH  = "jc8pJlPJgcNkMzNl"
 CHANNEL_ID   = int("-1002916915233")
