@@ -8,38 +8,74 @@ Telegram Bulk Forwarder — Resume via Saved Messages (100% Free)
 - Videos/files apne channel mein bhejta hai
 
 Env Vars: API_ID, API_HASH, SESSION_STRING, DEST_CHANNEL
+
+FIXES in this version:
+  1. Proper startup error logging (crash reason ab dikhega)
+  2. SESSION_STRING whitespace strip karta hai
+  3. DEST_CHANNEL int/string dono handle karta hai
+  4. FloodWait per-message retry loop (sirf ek baar nahi, jab tak wait khatam na ho)
+  5. Temp files /tmp mein save hoti hain (Render ke read-only ./ se bachne ke liye)
+  6. Graceful shutdown on KeyboardInterrupt
+  7. Thumbnail download error alag se handle hota hai
 """
 
 import asyncio
 import os
+import sys
 import logging
 import re
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.errors import UserAlreadyParticipantError, FloodWaitError
+from telethon.errors import (
+    UserAlreadyParticipantError,
+    FloodWaitError,
+    SessionPasswordNeededError,
+    AuthKeyUnregisteredError,
+    ApiIdInvalidError,
+)
 
+# ── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,   # Render stdout pe dikhe
 )
 log = logging.getLogger(__name__)
 
-# ── Hardcoded Config ─────────────────────────────────────────────────────────
+# ── Hardcoded Config ──────────────────────────────────────────────────────────
 INVITE_HASH  = "jc8pJlPJgcNkMzNl"
 CHANNEL_ID   = int("-1002916915233")   # t.me/c/2916915233 → -100 prefix
 MSG_START    = 22
 MSG_END      = 194
-DELAY        = 4
-PROGRESS_TAG = "BULK_PROGRESS"   # Saved Messages mein is tag se dhundhega
-# ────────────────────────────────────────────────────────────────────────────
+DELAY        = 4          # seconds between messages (flood se bachne ke liye)
+PROGRESS_TAG = "BULK_PROGRESS"
+TMP_DIR      = "/tmp"     # Render pe safe writable directory
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Env Vars ─────────────────────────────────────────────────────────────────
-API_ID         = int(os.environ["API_ID"])
-API_HASH       = os.environ["API_HASH"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-DEST_CHANNEL   = os.environ["DEST_CHANNEL"]
-# ────────────────────────────────────────────────────────────────────────────
+# ── Env Vars (with validation) ────────────────────────────────────────────────
+def get_env(key: str, cast=str) -> any:
+    val = os.environ.get(key, "").strip()
+    if not val:
+        log.error(f"❌ Environment variable '{key}' missing ya empty hai!")
+        sys.exit(1)
+    try:
+        return cast(val)
+    except (ValueError, TypeError) as e:
+        log.error(f"❌ '{key}' ka value invalid hai: {e}")
+        sys.exit(1)
+
+API_ID         = get_env("API_ID", int)
+API_HASH       = get_env("API_HASH")
+SESSION_STRING = get_env("SESSION_STRING")
+DEST_CHANNEL_RAW = get_env("DEST_CHANNEL")
+
+# DEST_CHANNEL int ya username dono ho sakta hai
+try:
+    DEST_CHANNEL = int(DEST_CHANNEL_RAW)
+except ValueError:
+    DEST_CHANNEL = DEST_CHANNEL_RAW   # @username string
+# ─────────────────────────────────────────────────────────────────────────────
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -50,28 +86,33 @@ async def get_last_completed() -> int:
     Bilkul FREE — koi disk nahi chahiye!
     """
     try:
-        async for msg in client.iter_messages("me", limit=30, search=PROGRESS_TAG):
-            match = re.search(rf"{PROGRESS_TAG}:(\d+)", msg.text or "")
+        async for msg in client.iter_messages("me", limit=50, search=PROGRESS_TAG):
+            match = re.search(rf"{re.escape(PROGRESS_TAG)}:(\d+)", msg.text or "")
             if match:
-                log.info(f"📂 Saved Messages se progress mili: MSG {match.group(1)}")
-                return int(match.group(1))
+                val = int(match.group(1))
+                log.info(f"📂 Saved Messages se progress mili: MSG {val}")
+                return val
     except Exception as e:
-        log.warning(f"Progress read error: {e}")
+        log.warning(f"⚠️  Progress read error (fresh start se chalenge): {e}")
     return MSG_START - 1
 
 
 async def save_progress(msg_id: int):
     """
     Telegram Saved Messages mein progress save karta hai.
-    Purana message delete karke naya bhejta hai — bilkul FREE!
+    Purana progress message delete karke naya bhejta hai.
     """
     try:
-        async for msg in client.iter_messages("me", limit=30, search=PROGRESS_TAG):
+        # Purane progress messages delete karo
+        to_delete = []
+        async for msg in client.iter_messages("me", limit=50, search=PROGRESS_TAG):
+            to_delete.append(msg)
+        for msg in to_delete:
             await msg.delete()
-            break
+        # Naya save karo
         await client.send_message("me", f"{PROGRESS_TAG}:{msg_id}")
     except Exception as e:
-        log.warning(f"Progress save error: {e}")
+        log.warning(f"⚠️  Progress save error: {e}")
 
 
 async def join_channel():
@@ -83,20 +124,20 @@ async def join_channel():
     except UserAlreadyParticipantError:
         log.info("✅ Pehle se joined hai — continue kar rahe hain.")
     except Exception as e:
-        log.warning(f"⚠️ Join attempt: {e}")
+        log.warning(f"⚠️  Join attempt result: {e}")
+        log.info("   (Agar already joined hai toh yeh error ignore kar sakte hain)")
 
 
-def extract_video_meta(message):
+def extract_video_meta(message) -> dict:
     """
     Message se video ka title, duration, w/h, thumbnail extract karta hai.
-    Returns dict with all available metadata.
     """
     meta = {
-        "title": None,
-        "duration": None,
-        "width": None,
-        "height": None,
-        "thumb": None,       # thumbnail bytes
+        "title":     None,
+        "duration":  None,
+        "width":     None,
+        "height":    None,
+        "thumb":     None,
         "mime_type": None,
     }
 
@@ -106,7 +147,6 @@ def extract_video_meta(message):
 
     meta["mime_type"] = doc.mime_type
 
-    # Document attributes mein title, duration, dimensions hote hain
     for attr in doc.attributes:
         cls_name = type(attr).__name__
 
@@ -116,7 +156,6 @@ def extract_video_meta(message):
             meta["height"]   = getattr(attr, "h", None)
 
         elif cls_name == "DocumentAttributeFilename":
-            # Filename se title banao (extension hata ke)
             fname = getattr(attr, "file_name", "") or ""
             if fname:
                 meta["title"] = os.path.splitext(fname)[0]
@@ -125,20 +164,20 @@ def extract_video_meta(message):
             meta["title"]    = getattr(attr, "title", None)
             meta["duration"] = getattr(attr, "duration", None)
 
-    # Thumbnail — doc ke thumbs mein pehla wala
     if doc.thumbs:
-        meta["thumb"] = doc.thumbs[-1]   # Sabse badi thumbnail
+        meta["thumb"] = doc.thumbs[-1]
 
     return meta
 
 
 async def process_message(msg_id: int, current: int, total: int) -> bool:
     """
-    Ek message fetch karta hai — title, thumbnail, duration ke saath upload karta hai.
-    Returns True agar success ya skip, False agar retry chahiye.
+    Ek message fetch karke destination channel mein bhejta hai.
+    Returns True = success ya permanent skip
+    Returns False = retry chahiye (FloodWait)
     """
-    file_path    = None
-    thumb_path   = None
+    file_path  = None
+    thumb_path = None
 
     try:
         message = await client.get_messages(CHANNEL_ID, ids=msg_id)
@@ -151,131 +190,162 @@ async def process_message(msg_id: int, current: int, total: int) -> bool:
             log.info(f"[{current}/{total}] ⏭  MSG {msg_id} — media nahi hai, skip.")
             return True
 
-        # Video metadata extract karo
-        meta = extract_video_meta(message)
-        title    = meta["title"]
-        duration = meta["duration"]
-        width    = meta["width"]
-        height   = meta["height"]
+        meta  = extract_video_meta(message)
+        title = meta["title"]
 
-        log.info(f"[{current}/{total}] 📥 Downloading MSG {msg_id}"
-                 + (f" — '{title}'" if title else "") + "...")
+        log.info(
+            f"[{current}/{total}] 📥 Downloading MSG {msg_id}"
+            + (f" — '{title}'" if title else "") + "..."
+        )
 
-        # Video file download
-        file_path = await client.download_media(message, file=f"./temp_vid_{msg_id}")
+        # /tmp mein save karo (Render pe safe hai)
+        file_path = await client.download_media(
+            message,
+            file=os.path.join(TMP_DIR, f"vid_{msg_id}")
+        )
 
         if not file_path:
             log.warning(f"[{current}/{total}] ⚠️  MSG {msg_id} — download failed, skip.")
             return True
 
-        # Thumbnail download (agar available hai)
+        # Thumbnail download (optional — na mile toh chalega)
         if meta["thumb"]:
             try:
                 thumb_path = await client.download_media(
                     message,
-                    file=f"./temp_thumb_{msg_id}.jpg",
-                    thumb=-1    # Best quality thumbnail
+                    file=os.path.join(TMP_DIR, f"thumb_{msg_id}.jpg"),
+                    thumb=-1
                 )
-            except Exception:
-                thumb_path = None   # Thumbnail na mile toh bhi chalega
+            except Exception as thumb_err:
+                log.debug(f"Thumbnail download skip: {thumb_err}")
+                thumb_path = None
 
         caption = message.text or message.message or ""
 
-        log.info(f"[{current}/{total}] 📤 Uploading MSG {msg_id} to {DEST_CHANNEL}...")
+        log.info(f"[{current}/{total}] 📤 Uploading MSG {msg_id} → {DEST_CHANNEL}...")
 
         await client.send_file(
             DEST_CHANNEL,
             file_path,
             caption=caption,
             supports_streaming=True,
-            # ── Ye sab original jaisi dikhegi video ──
             attributes=message.document.attributes if message.document else [],
-            thumb=thumb_path,       # Original thumbnail
+            thumb=thumb_path,
         )
 
-        log.info(f"[{current}/{total}] ✅ MSG {msg_id} done!"
-                 + (f" | 🎬 {title}" if title else "")
-                 + (f" | ⏱ {duration}s" if duration else ""))
+        log.info(
+            f"[{current}/{total}] ✅ MSG {msg_id} done!"
+            + (f" | 🎬 {title}"            if title            else "")
+            + (f" | ⏱ {meta['duration']}s" if meta["duration"] else "")
+        )
         return True
 
     except FloodWaitError as e:
-        log.warning(f"[{current}/{total}] ⏳ FloodWait {e.seconds}s — wait kar rahe hain...")
+        log.warning(
+            f"[{current}/{total}] ⏳ FloodWait {e.seconds}s — wait kar rahe hain..."
+        )
         await asyncio.sleep(e.seconds + 5)
-        return False   # Retry
+        return False   # caller retry karega
 
     except Exception as e:
-        log.error(f"[{current}/{total}] ❌ MSG {msg_id} error: {e}")
-        return True    # Skip and move on
+        log.error(f"[{current}/{total}] ❌ MSG {msg_id} error: {type(e).__name__}: {e}")
+        return True    # skip and move on
 
     finally:
         for path in [file_path, thumb_path]:
             if path and os.path.exists(path):
                 try:
                     os.remove(path)
-                except:
+                except Exception:
                     pass
 
 
 async def main():
-    await client.start()
+    log.info("=" * 55)
+    log.info("🚀 Telegram Bulk Forwarder starting...")
+    log.info(f"   Source channel : {CHANNEL_ID}")
+    log.info(f"   Dest channel   : {DEST_CHANNEL}")
+    log.info(f"   Message range  : {MSG_START} → {MSG_END}")
+    log.info("=" * 55)
+
+    # ── Client start with proper error messages ──
+    try:
+        await client.start()
+    except ApiIdInvalidError:
+        log.error("❌ API_ID ya API_HASH galat hai! my.telegram.org se check karo.")
+        sys.exit(1)
+    except AuthKeyUnregisteredError:
+        log.error("❌ SESSION_STRING expire ho gaya hai! Naya session generate karo.")
+        sys.exit(1)
+    except SessionPasswordNeededError:
+        log.error("❌ Account mein 2FA enabled hai. Session generate karte waqt password dena hoga.")
+        sys.exit(1)
+    except Exception as e:
+        log.error(f"❌ Login failed: {type(e).__name__}: {e}")
+        sys.exit(1)
+
     me = await client.get_me()
     log.info(f"✅ Logged in as: {me.first_name} (@{me.username})")
 
     # Channel join karo
     await join_channel()
 
-    # Resume point check karo (Saved Messages se)
-    last_done = await get_last_completed()
+    # Resume point check karo
+    last_done  = await get_last_completed()
     start_from = last_done + 1
 
-    total_range = MSG_END - MSG_START + 1
-    already_done = last_done - MSG_START + 1 if last_done >= MSG_START else 0
+    total_range  = MSG_END - MSG_START + 1
+    already_done = max(0, last_done - MSG_START + 1)
 
     if start_from > MSG_END:
         log.info("🎉 Sab pehle se complete ho chuka hai! Kuch kaam nahi bacha.")
         return
 
     if already_done > 0:
-        log.info(f"🔄 Resume ho raha hai MSG {start_from} se (pehle {already_done} already done)")
+        log.info(
+            f"🔄 Resume ho raha hai MSG {start_from} se "
+            f"(pehle {already_done}/{total_range} already done)"
+        )
     else:
-        log.info(f"🚀 Fresh start — MSG {MSG_START} se {MSG_END} tak")
+        log.info(f"🆕 Fresh start — MSG {MSG_START} se {MSG_END} tak")
 
-    log.info(f"📊 Total range: {total_range} messages | Remaining: {MSG_END - start_from + 1}")
+    remaining = MSG_END - start_from + 1
+    log.info(f"📊 Remaining: {remaining} messages")
     log.info("=" * 55)
 
     success_count = 0
-    skip_count = 0
-    current = already_done + 1
+    skip_count    = 0
+    current       = already_done + 1
 
     for msg_id in range(start_from, MSG_END + 1):
-        result = await process_message(msg_id, current, total_range)
 
-        if result:
-            await save_progress(msg_id)   # ← Saved Messages mein save
-            success_count += 1
-            current += 1
-            if msg_id < MSG_END:
-                await asyncio.sleep(DELAY)
-        else:
-            # FloodWait ya retry case — same msg dobara try karo
-            log.info(f"🔁 MSG {msg_id} retry ho raha hai...")
-            result2 = await process_message(msg_id, current, total_range)
-            if result2:
-                await save_progress(msg_id)
-                success_count += 1
-                current += 1
-                await asyncio.sleep(DELAY)
-            else:
-                skip_count += 1
-                current += 1
+        # Retry loop — FloodWait ke baad same message dobara try karo
+        while True:
+            result = await process_message(msg_id, current, total_range)
+            if result:
+                break   # success ya permanent skip
+            # result = False means FloodWait → loop dobara chalega
+
+        await save_progress(msg_id)
+        success_count += 1
+        current       += 1
+
+        if msg_id < MSG_END:
+            await asyncio.sleep(DELAY)
 
     log.info("=" * 55)
     log.info("🎉 Bulk forward COMPLETE!")
     log.info(f"   ✅ Processed : {success_count}")
-    log.info(f"   ⏭  Skipped   : {skip_count}")
     log.info(f"   📦 Total     : {total_range}")
     log.info("=" * 55)
 
 
-with client:
-    client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    try:
+        with client:
+            client.loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        log.info("⛔ User ne stop kiya. Abhi tak ki progress save ho chuki hai.")
+    except Exception as e:
+        log.error(f"💥 Fatal error: {type(e).__name__}: {e}", exc_info=True)
+        sys.exit(1)
