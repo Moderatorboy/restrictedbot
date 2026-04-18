@@ -1,7 +1,9 @@
 """
-Telegram Bulk Forwarder — Resume via Saved Messages (100% Free)
-================================================================
-Python 3.14 compatible — client ab async context ke andar banta hai.
+Telegram Bulk Forwarder — With Download/Upload Progress Bar
+============================================================
+- Download aur Upload ka live % dikhta hai logs mein
+- Render Web Service compatible (HTTP status page)
+- Resume via Saved Messages
 
 Env Vars: API_ID, API_HASH, SESSION_STRING, DEST_CHANNEL
 """
@@ -11,6 +13,9 @@ import os
 import sys
 import logging
 import re
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -39,9 +44,10 @@ MSG_END      = 194
 DELAY        = 4
 PROGRESS_TAG = "BULK_PROGRESS"
 TMP_DIR      = "/tmp"
+PORT         = int(os.environ.get("PORT", 10000))
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Env Vars (with validation) ────────────────────────────────────────────────
+# ── Env Vars ──────────────────────────────────────────────────────────────────
 def get_env(key: str, cast=str):
     val = os.environ.get(key, "").strip()
     if not val:
@@ -61,9 +67,129 @@ DEST_CHANNEL_RAW = get_env("DEST_CHANNEL")
 try:
     DEST_CHANNEL = int(DEST_CHANNEL_RAW)
 except ValueError:
-    DEST_CHANNEL = DEST_CHANNEL_RAW   # @username string
+    DEST_CHANNEL = DEST_CHANNEL_RAW
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Global Status (HTTP page ke liye) ─────────────────────────────────────────
+status = {
+    "msg_current": 0,
+    "msg_total":   MSG_END - MSG_START + 1,
+    "msg_id":      0,
+    "phase":       "Starting...",   # Downloading / Uploading / Done
+    "file_done":   0,               # bytes
+    "file_total":  0,               # bytes
+    "file_pct":    0,               # 0-100
+    "speed_kb":    0.0,             # KB/s
+    "done":        False,
+    "last_title":  "",
+}
+
+# ── Progress Bar Helper ───────────────────────────────────────────────────────
+def fmt_size(b: int) -> str:
+    if b >= 1024 ** 3:
+        return f"{b/1024**3:.1f} GB"
+    if b >= 1024 ** 2:
+        return f"{b/1024**2:.1f} MB"
+    if b >= 1024:
+        return f"{b/1024:.1f} KB"
+    return f"{b} B"
+
+def make_bar(pct: int, width: int = 20) -> str:
+    filled = int(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
+
+class ProgressCallback:
+    """
+    Telethon progress callback — download aur upload dono ke liye.
+    Har 5% ya har 3 second pe log print karta hai.
+    """
+    def __init__(self, msg_id: int, phase: str, title: str = ""):
+        self.msg_id     = msg_id
+        self.phase      = phase   # "📥 DL" ya "📤 UL"
+        self.title      = title
+        self.last_pct   = -1
+        self.last_time  = time.time()
+        self.last_bytes = 0
+        self.start_time = time.time()
+
+    def __call__(self, current: int, total: int):
+        if total <= 0:
+            return
+
+        pct       = int(current * 100 / total)
+        now       = time.time()
+        elapsed   = now - self.last_time
+        speed_bps = (current - self.last_bytes) / elapsed if elapsed > 0 else 0
+        speed_kb  = speed_bps / 1024
+
+        # Status update karo (HTTP page ke liye)
+        status["phase"]      = f"{self.phase} MSG {self.msg_id}"
+        status["file_done"]  = current
+        status["file_total"] = total
+        status["file_pct"]   = pct
+        status["speed_kb"]   = round(speed_kb, 1)
+
+        # Log sirf jab 5% change ho ya 3 sec guzre
+        if pct != self.last_pct and (pct % 5 == 0 or pct >= 99) or (now - self.last_time >= 3):
+            bar = make_bar(pct)
+            eta_sec = int((total - current) / speed_bps) if speed_bps > 0 else 0
+            eta_str = f"{eta_sec//60}m{eta_sec%60:02d}s" if eta_sec > 0 else "..."
+
+            log.info(
+                f"  {self.phase} [{bar}] {pct:3d}% "
+                f"{fmt_size(current)}/{fmt_size(total)} "
+                f"@ {speed_kb:.0f} KB/s  ETA {eta_str}"
+                + (f"  [{self.title}]" if self.title else "")
+            )
+            self.last_pct   = pct
+            self.last_time  = now
+            self.last_bytes = current
+
+# ── HTTP Status Page ──────────────────────────────────────────────────────────
+class StatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        s = status
+        pct      = s["file_pct"]
+        bar_html = "█" * (pct // 5) + "░" * (20 - pct // 5)
+        msg_pct  = int(s["msg_current"] * 100 / s["msg_total"]) if s["msg_total"] else 0
+
+        body = f"""<!DOCTYPE html>
+<html><head>
+<meta http-equiv="refresh" content="5">
+<style>
+  body {{ font-family: monospace; background: #111; color: #eee; padding: 20px; }}
+  .bar {{ color: #0f0; font-size: 1.2em; }}
+  .info {{ color: #aaa; }}
+  h2 {{ color: #fff; }}
+</style>
+</head><body>
+<h2>📡 Telegram Bulk Forwarder</h2>
+<p><b>Messages:</b> {s['msg_current']} / {s['msg_total']} &nbsp; ({msg_pct}%)</p>
+<p class="bar">[{'█'*(msg_pct//5)}{'░'*(20-msg_pct//5)}] {msg_pct}%</p>
+<hr>
+<p><b>Current:</b> {s['phase']}{' — ' + s['last_title'] if s['last_title'] else ''}</p>
+<p><b>File:</b> {fmt_size(s['file_done'])} / {fmt_size(s['file_total'])}</p>
+<p class="bar">[{bar_html}] {pct}%</p>
+<p class="info">Speed: {s['speed_kb']} KB/s</p>
+<p class="info">Done: {'✅ Yes' if s['done'] else '⏳ Running...'}</p>
+<p class="info"><small>Auto-refresh every 5s</small></p>
+</body></html>""".encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+def start_http_server():
+    server = HTTPServer(("0.0.0.0", PORT), StatusHandler)
+    log.info(f"🌐 Status page: port {PORT}")
+    server.serve_forever()
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def get_last_completed(client: TelegramClient) -> int:
     try:
@@ -128,7 +254,6 @@ def extract_video_meta(message) -> dict:
 
 async def process_message(client: TelegramClient, msg_id: int,
                            current: int, total: int) -> bool:
-    """True = done/skip, False = FloodWait retry chahiye"""
     file_path  = None
     thumb_path = None
     try:
@@ -142,17 +267,28 @@ async def process_message(client: TelegramClient, msg_id: int,
             return True
 
         meta  = extract_video_meta(message)
-        title = meta["title"]
-        log.info(f"[{current}/{total}] 📥 Downloading MSG {msg_id}"
+        title = meta["title"] or ""
+        status["last_title"] = title
+        status["msg_id"]     = msg_id
+
+        # ── DOWNLOAD with progress ──
+        log.info(f"[{current}/{total}] 📥 MSG {msg_id} download shuru"
                  + (f" — '{title}'" if title else "") + "...")
 
+        dl_cb = ProgressCallback(msg_id, "📥 DL", title)
         file_path = await client.download_media(
-            message, file=os.path.join(TMP_DIR, f"vid_{msg_id}")
+            message,
+            file=os.path.join(TMP_DIR, f"vid_{msg_id}"),
+            progress_callback=dl_cb,
         )
+
         if not file_path:
             log.warning(f"[{current}/{total}] ⚠️  MSG {msg_id} — download failed, skip.")
             return True
 
+        log.info(f"[{current}/{total}] ✅ Download done — {fmt_size(os.path.getsize(file_path))}")
+
+        # Thumbnail
         if meta["thumb"]:
             try:
                 thumb_path = await client.download_media(
@@ -164,8 +300,11 @@ async def process_message(client: TelegramClient, msg_id: int,
                 thumb_path = None
 
         caption = message.text or message.message or ""
-        log.info(f"[{current}/{total}] 📤 Uploading MSG {msg_id} → {DEST_CHANNEL}...")
 
+        # ── UPLOAD with progress ──
+        log.info(f"[{current}/{total}] 📤 MSG {msg_id} upload shuru → {DEST_CHANNEL}...")
+
+        ul_cb = ProgressCallback(msg_id, "📤 UL", title)
         await client.send_file(
             DEST_CHANNEL,
             file_path,
@@ -173,21 +312,26 @@ async def process_message(client: TelegramClient, msg_id: int,
             supports_streaming=True,
             attributes=message.document.attributes if message.document else [],
             thumb=thumb_path,
+            progress_callback=ul_cb,
         )
+
         log.info(
-            f"[{current}/{total}] ✅ MSG {msg_id} done!"
+            f"[{current}/{total}] ✅ MSG {msg_id} COMPLETE!"
             + (f" | 🎬 {title}"             if title            else "")
             + (f" | ⏱ {meta['duration']}s"  if meta["duration"] else "")
         )
+        status["phase"] = f"✅ MSG {msg_id} done"
         return True
 
     except FloodWaitError as e:
         log.warning(f"[{current}/{total}] ⏳ FloodWait {e.seconds}s — waiting...")
+        status["phase"] = f"⏳ FloodWait {e.seconds}s"
         await asyncio.sleep(e.seconds + 5)
         return False
 
     except Exception as e:
         log.error(f"[{current}/{total}] ❌ MSG {msg_id} — {type(e).__name__}: {e}")
+        status["phase"] = f"❌ MSG {msg_id} error"
         return True
 
     finally:
@@ -200,7 +344,6 @@ async def process_message(client: TelegramClient, msg_id: int,
 
 
 async def main():
-    # ── FIX: Client async context ke andar banao (Python 3.14 compatible) ──
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
     log.info("=" * 55)
@@ -219,7 +362,7 @@ async def main():
         log.error("❌ SESSION_STRING expire ho gaya! Naya generate karo.")
         sys.exit(1)
     except SessionPasswordNeededError:
-        log.error("❌ 2FA enabled hai — session generate karte waqt password dena hoga.")
+        log.error("❌ 2FA enabled hai.")
         sys.exit(1)
     except Exception as e:
         log.error(f"❌ Login failed: {type(e).__name__}: {e}")
@@ -236,8 +379,13 @@ async def main():
         total_range  = MSG_END - MSG_START + 1
         already_done = max(0, last_done - MSG_START + 1)
 
+        status["msg_total"] = total_range
+
         if start_from > MSG_END:
-            log.info("🎉 Sab pehle se complete! Kuch bacha nahi.")
+            log.info("🎉 Sab complete! Kuch bacha nahi.")
+            status["done"]  = True
+            status["phase"] = "🎉 All done!"
+            await asyncio.sleep(86400 * 7)
             return
 
         if already_done > 0:
@@ -252,6 +400,8 @@ async def main():
         current       = already_done + 1
 
         for msg_id in range(start_from, MSG_END + 1):
+            status["msg_current"] = current
+
             while True:
                 result = await process_message(client, msg_id, current, total_range)
                 if result:
@@ -265,17 +415,21 @@ async def main():
                 await asyncio.sleep(DELAY)
 
         log.info("=" * 55)
-        log.info("🎉 Bulk forward COMPLETE!")
-        log.info(f"   ✅ Processed : {success_count}")
-        log.info(f"   📦 Total     : {total_range}")
+        log.info(f"🎉 COMPLETE! {success_count}/{total_range} messages forwarded.")
         log.info("=" * 55)
+
+        status["done"]        = True
+        status["msg_current"] = total_range
+        status["phase"]       = "🎉 All done!"
+        await asyncio.sleep(86400 * 7)
 
 
 if __name__ == "__main__":
+    threading.Thread(target=start_http_server, daemon=True).start()
     try:
-        asyncio.run(main())   # Python 3.14 safe
+        asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("⛔ Stopped. Progress save ho chuki hai.")
+        log.info("⛔ Stopped.")
     except Exception as e:
         log.error(f"💥 Fatal: {type(e).__name__}: {e}", exc_info=True)
         sys.exit(1)
